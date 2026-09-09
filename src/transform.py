@@ -42,6 +42,25 @@ ENERGY_COLUMNS: tuple[str, ...] = (
     "q4eq",
 )
 
+# ImpEp/ExpEp di meter = 0.1 kWh per unit. Q1–Q4 tidak di-scale.
+ACTIVE_ENERGY_SCALE = 0.1
+
+
+def _src_energy(col: str, alias: str = "r") -> str:
+    expr = f"{alias}.{col}"
+    if col in ("impep", "expep"):
+        return f"({expr} * {ACTIVE_ENERGY_SCALE})"
+    return expr
+
+
+def _energy_raw_select() -> str:
+    return ",\n        ".join(
+        f"(array_agg({_src_energy(c)} ORDER BY r.time DESC))[1] "
+        f"- (array_agg({_src_energy(c)} ORDER BY r.time ASC))[1] AS {c}_raw"
+        for c in ENERGY_COLUMNS
+    )
+
+
 AGG_VALUE_COLS_5MIN_1H: tuple[str, ...] = (
     "device_type",
     "sample_count",
@@ -80,6 +99,15 @@ def _bucket_5min(tz: str) -> str:
     """.strip()
 
 
+def _read_from_expr(tz: str, lookback_hours: int = 1) -> str:
+    """Awal jam (lookback_hours) sebelum window_start, supaya bucket yang belum lengkap diulang."""
+    hours = max(1, int(lookback_hours))
+    return (
+        f"((date_trunc('hour', %s AT TIME ZONE '{tz}') "
+        f"AT TIME ZONE '{tz}') - interval '{hours} hours')"
+    )
+
+
 def _safe_delta(end_expr: str, start_expr: str) -> str:
     return (
         f"CASE WHEN {end_expr} IS NULL OR {start_expr} IS NULL THEN NULL "
@@ -95,16 +123,27 @@ def _reset_flag(end_expr: str, start_expr: str) -> str:
     )
 
 
-def build_upsert_5min(tz: str, wbp_start: int, wbp_end: int) -> str:
+def _nearest_snapshot_order(*distinct_cols: str) -> str:
+    """Utamakan reading terakhir yang <= batas jam, baru yang setelahnya."""
+    keys = ",\n            ".join(distinct_cols)
+    bound = distinct_cols[-1]
+    return f"""
+            {keys},
+            CASE WHEN r.time <= {bound} THEN 0 ELSE 1 END,
+            CASE WHEN r.time <= {bound} THEN r.time END DESC NULLS LAST,
+            r.time ASC
+    """.strip()
+
+
+def build_upsert_5min(
+    tz: str, wbp_start: int, wbp_end: int, lookback_hours: int = 1
+) -> str:
     bucket = _bucket_5min(tz)
+    read_from = _read_from_expr(tz, lookback_hours)
     tariff = _tariff_case(tz, wbp_start, wbp_end, bucket)
     avg_sel = _avg_select()
 
-    energy_raw = ",\n        ".join(
-        f"(array_agg(r.{c} ORDER BY r.time DESC))[1] "
-        f"- (array_agg(r.{c} ORDER BY r.time ASC))[1] AS {c}_raw"
-        for c in ENERGY_COLUMNS
-    )
+    energy_raw = _energy_raw_select()
     energy_sel = ",\n        ".join(
         f"CASE WHEN {c}_raw < 0 THEN 0 ELSE {c}_raw END AS {c}_delta"
         for c in ENERGY_COLUMNS
@@ -147,7 +186,7 @@ def build_upsert_5min(tz: str, wbp_start: int, wbp_end: int) -> str:
             MAX(r.active_power_demand) AS active_power_demand_max,
             {energy_raw}
         FROM public.meter_readings r
-        WHERE r.time >= %s
+        WHERE r.time >= {read_from}
           AND r.time < %s
           AND ({bucket}) + interval '5 minutes' <= %s
         GROUP BY 1, 2, 5
@@ -157,16 +196,15 @@ def build_upsert_5min(tz: str, wbp_start: int, wbp_end: int) -> str:
     """
 
 
-def build_select_5min(tz: str, wbp_start: int, wbp_end: int) -> str:
+def build_select_5min(
+    tz: str, wbp_start: int, wbp_end: int, lookback_hours: int = 1
+) -> str:
     """SELECT agregasi 5 menit (untuk cross-DB)."""
     bucket = _bucket_5min(tz)
+    read_from = _read_from_expr(tz, lookback_hours)
     tariff = _tariff_case(tz, wbp_start, wbp_end, bucket)
     avg_sel = _avg_select()
-    energy_raw = ",\n        ".join(
-        f"(array_agg(r.{c} ORDER BY r.time DESC))[1] "
-        f"- (array_agg(r.{c} ORDER BY r.time ASC))[1] AS {c}_raw"
-        for c in ENERGY_COLUMNS
-    )
+    energy_raw = _energy_raw_select()
     energy_sel = ",\n        ".join(
         f"CASE WHEN {c}_raw < 0 THEN 0 ELSE {c}_raw END AS {c}_delta"
         for c in ENERGY_COLUMNS
@@ -202,7 +240,7 @@ def build_select_5min(tz: str, wbp_start: int, wbp_end: int) -> str:
             MAX(r.active_power_demand) AS active_power_demand_max,
             {energy_raw}
         FROM public.meter_readings r
-        WHERE r.time >= %s
+        WHERE r.time >= {read_from}
           AND r.time < %s
           AND ({bucket}) + interval '5 minutes' <= %s
         GROUP BY 1, 2, 5
@@ -214,13 +252,17 @@ def build_upsert_1h(
     wbp_start: int,
     wbp_end: int,
     tolerance_minutes: int,
+    lookback_hours: int = 1,
 ) -> str:
     """
     Agregasi 1 jam:
     - metrik instantaneous dari AVG/MAX dalam jam
-    - energi dari selisih snapshot di batas jam (±tolerance)
+    - energi dari selisih snapshot di batas jam (±tolerance, default 5 menit)
+    - snapshot: reading terakhir <= batas jam; jika tidak ada, reading terdekat setelahnya
+    - lookback 1 jam: ulangi jam sebelumnya yang belum sempat ditutup
     """
     hour_bucket = f"(date_trunc('hour', r.time AT TIME ZONE '{tz}') AT TIME ZONE '{tz}')"
+    read_from = _read_from_expr(tz, lookback_hours)
     tariff = _tariff_case(tz, wbp_start, wbp_end, "h.bucket_start")
     avg_sel = _avg_select()
 
@@ -245,7 +287,7 @@ def build_upsert_1h(
             (date_trunc('hour', time AT TIME ZONE '{tz}') AT TIME ZONE '{tz}')
                 AS bucket_start
         FROM public.meter_readings
-        WHERE time >= %s
+        WHERE time >= {read_from}
           AND time < %s
     ),
     complete_hours AS (
@@ -262,8 +304,8 @@ def build_upsert_1h(
         SELECT DISTINCT ON (b.meter_id, b.bound)
             b.meter_id,
             b.bound,
-            r.impep,
-            r.expep,
+            {_src_energy("impep")} AS impep,
+            {_src_energy("expep")} AS expep,
             r.q1eq,
             r.q2eq,
             r.q3eq,
@@ -274,9 +316,7 @@ def build_upsert_1h(
            AND r.time >= b.bound - (%s * interval '1 minute')
            AND r.time <= b.bound + (%s * interval '1 minute')
         ORDER BY
-            b.meter_id,
-            b.bound,
-            ABS(EXTRACT(EPOCH FROM (r.time - b.bound)))
+            {_nearest_snapshot_order("b.meter_id", "b.bound")}
     ),
     power_agg AS (
         SELECT
@@ -291,7 +331,7 @@ def build_upsert_1h(
         INNER JOIN complete_hours h
             ON h.meter_id = r.meter_id
            AND {hour_bucket} = h.bucket_start
-        WHERE r.time >= %s
+        WHERE r.time >= {read_from}
           AND r.time < %s
         GROUP BY 1, 2
     )
@@ -331,9 +371,11 @@ def build_select_1h(
     wbp_start: int,
     wbp_end: int,
     tolerance_minutes: int,
+    lookback_hours: int = 1,
 ) -> str:
     """SELECT agregasi 1 jam (untuk cross-DB). Parameter sama dengan upsert."""
     hour_bucket = f"(date_trunc('hour', r.time AT TIME ZONE '{tz}') AT TIME ZONE '{tz}')"
+    read_from = _read_from_expr(tz, lookback_hours)
     tariff = _tariff_case(tz, wbp_start, wbp_end, "h.bucket_start")
     avg_sel = _avg_select()
     energy_deltas = ",\n        ".join(
@@ -351,7 +393,7 @@ def build_select_1h(
             (date_trunc('hour', time AT TIME ZONE '{tz}') AT TIME ZONE '{tz}')
                 AS bucket_start
         FROM public.meter_readings
-        WHERE time >= %s
+        WHERE time >= {read_from}
           AND time < %s
     ),
     complete_hours AS (
@@ -368,8 +410,8 @@ def build_select_1h(
         SELECT DISTINCT ON (b.meter_id, b.bound)
             b.meter_id,
             b.bound,
-            r.impep,
-            r.expep,
+            {_src_energy("impep")} AS impep,
+            {_src_energy("expep")} AS expep,
             r.q1eq,
             r.q2eq,
             r.q3eq,
@@ -380,9 +422,7 @@ def build_select_1h(
            AND r.time >= b.bound - (%s * interval '1 minute')
            AND r.time <= b.bound + (%s * interval '1 minute')
         ORDER BY
-            b.meter_id,
-            b.bound,
-            ABS(EXTRACT(EPOCH FROM (r.time - b.bound)))
+            {_nearest_snapshot_order("b.meter_id", "b.bound")}
     ),
     power_agg AS (
         SELECT
@@ -397,7 +437,7 @@ def build_select_1h(
         INNER JOIN complete_hours h
             ON h.meter_id = r.meter_id
            AND {hour_bucket} = h.bucket_start
-        WHERE r.time >= %s
+        WHERE r.time >= {read_from}
           AND r.time < %s
         GROUP BY 1, 2
     )
@@ -443,23 +483,24 @@ def _month_start_expr(tz: str, time_col: str = "bucket_start") -> str:
     )
 
 
-def _touched_days_cte(tz: str) -> str:
+def _touched_days_cte(tz: str, lookback_hours: int = 1) -> str:
     day_expr = _day_start_expr(tz, "bucket_start")
+    read_from = _read_from_expr(tz, lookback_hours)
     return f"""
     touched_days AS (
         SELECT DISTINCT {day_expr} AS day_start
         FROM datamart.meter_agg_1h
         WHERE bucket_start < %s
-          AND bucket_start + interval '1 hour' > %s
+          AND bucket_start + interval '1 hour' > {read_from}
     )
     """.strip()
 
 
-def build_upsert_daily_from_1h(tz: str) -> str:
+def build_upsert_daily_from_1h(tz: str, lookback_hours: int = 1) -> str:
     """Rollup harian dari meter_agg_1h + peak dari 5min untuk ia_max."""
     day_expr = _day_start_expr(tz, "h.bucket_start")
     day_expr_h = _day_start_expr(tz, "bucket_start")
-    touched = _touched_days_cte(tz)
+    touched = _touched_days_cte(tz, lookback_hours)
 
     daily_update_cols = [
         "device_type",
@@ -655,18 +696,15 @@ def build_upsert_counter_daily(tz: str, tolerance_minutes: int) -> str:
             b.meter_id,
             b.bucket_start,
             b.bound,
-            r.impep,
-            r.expep
+            {_src_energy("impep")} AS impep,
+            {_src_energy("expep")} AS expep
         FROM bounds b
         INNER JOIN public.meter_readings r
             ON r.meter_id = b.meter_id
            AND r.time >= b.bound - (%s * interval '1 minute')
            AND r.time <= b.bound + (%s * interval '1 minute')
         ORDER BY
-            b.meter_id,
-            b.bucket_start,
-            b.bound,
-            ABS(EXTRACT(EPOCH FROM (r.time - b.bound)))
+            {_nearest_snapshot_order("b.meter_id", "b.bucket_start", "b.bound")}
     )
     INSERT INTO datamart.meter_counter_daily (
         bucket_start, meter_id,
@@ -720,18 +758,15 @@ def build_select_counter_daily(tz: str, tolerance_minutes: int) -> str:
             b.meter_id,
             b.bucket_start,
             b.bound,
-            r.impep,
-            r.expep
+            {_src_energy("impep")} AS impep,
+            {_src_energy("expep")} AS expep
         FROM bounds b
         INNER JOIN public.meter_readings r
             ON r.meter_id = b.meter_id
            AND r.time >= b.bound - (%s * interval '1 minute')
            AND r.time <= b.bound + (%s * interval '1 minute')
         ORDER BY
-            b.meter_id,
-            b.bucket_start,
-            b.bound,
-            ABS(EXTRACT(EPOCH FROM (r.time - b.bound)))
+            {_nearest_snapshot_order("b.meter_id", "b.bucket_start", "b.bound")}
     )
     SELECT
         dm.day_start AS bucket_start,
@@ -752,10 +787,11 @@ def build_select_counter_daily(tz: str, tolerance_minutes: int) -> str:
     """
 
 
-def build_upsert_monthly_from_daily(tz: str) -> str:
+def build_upsert_monthly_from_daily(tz: str, lookback_hours: int = 1) -> str:
     """Rollup bulanan dari meter_agg_daily untuk bulan yang disentuh window."""
     month_expr = _month_start_expr(tz, "d.bucket_start")
     month_expr_plain = _month_start_expr(tz, "bucket_start")
+    read_from = _read_from_expr(tz, lookback_hours)
 
     monthly_update_cols = [
         "device_type",
@@ -789,7 +825,7 @@ def build_upsert_monthly_from_daily(tz: str) -> str:
         SELECT DISTINCT {month_expr_plain} AS month_start
         FROM datamart.meter_agg_daily
         WHERE bucket_start < %s
-          AND bucket_start + interval '1 day' > %s
+          AND bucket_start + interval '1 day' > {read_from}
     ),
     daily AS (
         SELECT d.*

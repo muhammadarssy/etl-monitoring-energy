@@ -73,9 +73,13 @@ def _rollup_marts(
     counts: dict[str, int] = {}
     tz = settings.timezone
     tol = settings.etl_boundary_tolerance_minutes
+    lookback = settings.etl_lookback_hours
 
     with conn.cursor() as cur:
-        cur.execute(build_upsert_daily_from_1h(tz), (window_end, window_start))
+        cur.execute(
+            build_upsert_daily_from_1h(tz, lookback),
+            (window_end, window_start),
+        )
         counts["daily"] = cur.rowcount
 
     with conn.cursor() as cur:
@@ -86,7 +90,10 @@ def _rollup_marts(
         counts["counter_daily"] = cur.rowcount
 
     with conn.cursor() as cur:
-        cur.execute(build_upsert_monthly_from_daily(tz), (window_end, window_start))
+        cur.execute(
+            build_upsert_monthly_from_daily(tz, lookback),
+            (window_end, window_start),
+        )
         counts["monthly"] = cur.rowcount
 
     return counts
@@ -103,13 +110,14 @@ def aggregate_window_same_db(
     tz = settings.timezone
     wbp_s = settings.wbp_start_hour
     wbp_e = settings.wbp_end_hour
+    lookback = settings.etl_lookback_hours
 
-    sql_5 = build_upsert_5min(tz, wbp_s, wbp_e)
+    sql_5 = build_upsert_5min(tz, wbp_s, wbp_e, lookback)
     with conn.cursor() as cur:
         cur.execute(sql_5, (window_start, window_end, window_end))
         counts["5min"] = cur.rowcount
 
-    sql_1h = build_upsert_1h(tz, wbp_s, wbp_e, tol)
+    sql_1h = build_upsert_1h(tz, wbp_s, wbp_e, tol, lookback)
     with conn.cursor() as cur:
         cur.execute(
             sql_1h,
@@ -133,12 +141,13 @@ def aggregate_window_cross_db(
     tz = settings.timezone
     wbp_s = settings.wbp_start_hour
     wbp_e = settings.wbp_end_hour
+    lookback = settings.etl_lookback_hours
 
     colnames = ["bucket_start", "meter_id", *AGG_VALUE_COLS_5MIN_1H]
 
     with source.cursor() as cur:
         cur.execute(
-            build_select_5min(tz, wbp_s, wbp_e),
+            build_select_5min(tz, wbp_s, wbp_e, lookback),
             (window_start, window_end, window_end),
         )
         rows_5 = cur.fetchall()
@@ -146,14 +155,17 @@ def aggregate_window_cross_db(
 
     with source.cursor() as cur:
         cur.execute(
-            build_select_1h(tz, wbp_s, wbp_e, tol),
+            build_select_1h(tz, wbp_s, wbp_e, tol, lookback),
             (window_start, window_end, window_end, tol, tol, window_start, window_end),
         )
         rows_1h = cur.fetchall()
     counts["1h"] = _upsert_rows(datamart, "datamart.meter_agg_1h", colnames, rows_1h)
 
     with datamart.cursor() as cur:
-        cur.execute(build_upsert_daily_from_1h(tz), (window_end, window_start))
+        cur.execute(
+            build_upsert_daily_from_1h(tz, lookback),
+            (window_end, window_start),
+        )
         counts["daily"] = cur.rowcount
 
     with source.cursor() as cur:
@@ -167,7 +179,10 @@ def aggregate_window_cross_db(
     )
 
     with datamart.cursor() as cur:
-        cur.execute(build_upsert_monthly_from_daily(tz), (window_end, window_start))
+        cur.execute(
+            build_upsert_monthly_from_daily(tz, lookback),
+            (window_end, window_start),
+        )
         counts["monthly"] = cur.rowcount
 
     return counts

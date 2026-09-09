@@ -30,14 +30,27 @@ class Settings(BaseSettings):
     etl_job_name: str = Field(default="meter_readings_wbp", alias="ETL_JOB_NAME")
     etl_lag_minutes: int = Field(default=15, alias="ETL_LAG_MINUTES")
     etl_chunk_hours: int = Field(default=1, alias="ETL_CHUNK_HOURS")
+    etl_lookback_hours: int = Field(default=1, alias="ETL_LOOKBACK_HOURS")
     etl_boundary_tolerance_minutes: int = Field(
-        default=2, alias="ETL_BOUNDARY_TOLERANCE_MINUTES"
+        default=5, alias="ETL_BOUNDARY_TOLERANCE_MINUTES"
     )
     etl_backfill_days: int = Field(default=30, alias="ETL_BACKFILL_DAYS")
 
     timezone: str = Field(default="Asia/Jakarta", alias="TIMEZONE")
     wbp_start_hour: int = Field(default=18, alias="WBP_START_HOUR")
     wbp_end_hour: int = Field(default=22, alias="WBP_END_HOUR")
+
+    runtime_job_name: str = Field(
+        default="meter_runtime_daily", alias="RUNTIME_JOB_NAME"
+    )
+    pt_on_threshold: float = Field(
+        default=5.0,
+        alias="PT_ON_THRESHOLD",
+        description=(
+            "Ambang PT (Watt). Nilai PT di bawah atau sama dengan ini "
+            "dianggap mati/noise, bukan sesi nyala."
+        ),
+    )
 
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 

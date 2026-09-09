@@ -184,6 +184,26 @@ CREATE INDEX IF NOT EXISTS idx_counter_daily_meter_time
 CREATE INDEX IF NOT EXISTS idx_agg_monthly_meter_time
     ON datamart.meter_agg_monthly (meter_id, bucket_start DESC);
 
+-- Sesi nyala/mati harian (job runtime_daily.py, 1x per hari)
+-- energy: 1 baris per sesi (start_time / stop_time)
+-- utils : 1 baris per hari (running_seconds saja, on/off tidak menentu)
+CREATE TABLE IF NOT EXISTS datamart.meter_runtime_session (
+    bucket_start      TIMESTAMPTZ     NOT NULL,
+    meter_id          TEXT            NOT NULL,
+    device_type       TEXT            NOT NULL,
+    session_no        INTEGER         NOT NULL,
+    start_time        TIMESTAMPTZ,
+    stop_time         TIMESTAMPTZ,
+    running_seconds   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    still_running     BOOLEAN         NOT NULL DEFAULT FALSE,
+    sample_count      INTEGER         NOT NULL DEFAULT 0,
+    pt_max            DOUBLE PRECISION,
+    PRIMARY KEY (bucket_start, meter_id, session_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_session_meter_time
+    ON datamart.meter_runtime_session (meter_id, bucket_start DESC);
+
 -- Migrasi untuk instalasi lama (aman dijalankan ulang)
 ALTER TABLE datamart.meter_agg_daily ADD COLUMN IF NOT EXISTS q1eq_total DOUBLE PRECISION;
 ALTER TABLE datamart.meter_agg_daily ADD COLUMN IF NOT EXISTS q2eq_total DOUBLE PRECISION;

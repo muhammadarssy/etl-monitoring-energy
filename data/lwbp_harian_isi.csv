@@ -1,0 +1,13 @@
+tanggal,meter_id,device_type,kwh_lwbp,jam_kosong,catatan
+2026-08-08,meter_id1,energy,,semua LWBP,
+2026-08-01,meter_id2,energy,,semua LWBP,
+2026-08-01,meter_id3,energy,,semua LWBP,
+2026-08-01,meter_id4,energy,,semua LWBP,
+2026-08-01,utils_id5,utils,,semua LWBP,
+2026-08-01,utils_id6,utils,,semua LWBP,
+2026-08-02,meter_id1,energy,,semua LWBP,
+2026-08-02,meter_id2,energy,,semua LWBP,
+2026-08-02,meter_id3,energy,,semua LWBP,
+2026-08-02,meter_id4,energy,,semua LWBP,
+2026-08-02,utils_id5,utils,,semua LWBP,
+2026-08-02,utils_id6,utils,,semua LWBP,
