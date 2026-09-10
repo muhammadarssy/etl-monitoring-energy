@@ -19,9 +19,15 @@ class Database:
         self._conn: Optional[psycopg2.extensions.connection] = None
 
     def connect(self) -> None:
-        self._conn = psycopg2.connect(self.dsn)
+        # Sesi UTC: isolasi dari timezone cluster DB (GMT+7 / Asia/Jakarta).
+        # TIMESTAMPTZ tetap instant absolut; bucket WBP/LWBP pakai AT TIME ZONE
+        # 'Asia/Jakarta' di SQL, bukan session timezone.
+        self._conn = psycopg2.connect(
+            self.dsn,
+            options="-c timezone=UTC -c datestyle=ISO,YMD",
+        )
         self._conn.autocommit = False
-        log.info("db_connected", db=self.label)
+        log.info("db_connected", db=self.label, session_tz="UTC")
 
     def close(self) -> None:
         if self._conn is not None:
